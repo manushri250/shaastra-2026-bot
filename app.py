@@ -66,6 +66,20 @@ OUT_OF_SCOPE_QUERY_WORDS = {
     "today",
     "tomorrow",
 }
+PERSONAL_QUERY_WORDS = {
+    "my",
+    "me",
+    "i",
+    "mine",
+    "you",
+    "your",
+    "name",
+    "age",
+    "email",
+    "phone",
+    "number",
+    "address",
+}
 SHAASTRA_QUERY_WORDS = {
     "shaastra",
     "event",
@@ -86,6 +100,7 @@ SHAASTRA_QUERY_WORDS = {
     "iit",
 }
 EVENT_LIST_CONTEXT_PREFIX = "__EVENT_NAME_LIST__"
+KNOWN_CONTEXT_PREFIX = "Shaastra 2026"
 MONTH_ALIASES = {
     "jan": "january",
     "january": "january",
@@ -568,12 +583,21 @@ def retrieve(
     semantic_scores = cosine_similarity(query_embedding, embeddings)[0]
     query_terms = set(re.findall(r"[a-z0-9]+", query.lower()))
     lexical_scores = []
+    normalized_query = normalize_lookup_text(query)
+    compact_query = normalized_query.replace(" ", "")
     for node in nodes:
         node_text = node.text(include_children=True).lower()
         node_terms = set(re.findall(r"[a-z0-9]+", node_text))
+        normalized_name = normalize_lookup_text(node.name)
+        compact_name = normalized_name.replace(" ", "")
         exact_name_bonus = 0.25 if node.name.lower() in query.lower() else 0.0
+        compact_name_bonus = (
+            0.45
+            if len(compact_name) >= 6 and compact_name in compact_query
+            else 0.0
+        )
         overlap = len(query_terms & node_terms) / max(len(query_terms), 1)
-        lexical_scores.append(overlap + exact_name_bonus)
+        lexical_scores.append(overlap + exact_name_bonus + compact_name_bonus)
     scores = semantic_scores + (0.20 * np.array(lexical_scores))
     top_indices = np.argsort(scores)[::-1][:top_k]
     return [retrieval_context_node(nodes[index]) for index in top_indices]
@@ -619,6 +643,40 @@ def is_event_name_list_query(query: str) -> bool:
     has_event_word = bool(query_terms & {"event", "events"})
     has_schedule_word = bool(query_terms & SCHEDULE_QUERY_WORDS)
     return has_event_word and (has_schedule_word or extract_query_month_day(query) is not None)
+
+
+def is_detail_query(query: str) -> bool:
+    query_terms = set(re.findall(r"[a-z0-9]+", query.lower()))
+    return bool(query_terms & {"detail", "details", "about", "tell", "describe", "info"})
+
+
+def matching_named_items_for_query(root: TreeNode, query: str) -> list[TreeNode]:
+    normalized_query = normalize_lookup_text(query)
+    compact_query = normalized_query.replace(" ", "")
+    query_terms = set(normalized_query.split())
+    matches = []
+    seen_paths = set()
+
+    for node in iter_nodes(root):
+        if node.node_type != "item" or is_schedule_artifact_item(node):
+            continue
+
+        normalized_name = normalize_lookup_text(node.name)
+        compact_name = normalized_name.replace(" ", "")
+        name_terms = set(normalized_name.split())
+        is_match = (
+            len(compact_name) >= 6
+            and compact_name in compact_query
+            or bool(name_terms)
+            and name_terms <= query_terms
+        )
+        if not is_match or node.path in seen_paths:
+            continue
+
+        matches.append(node)
+        seen_paths.add(node.path)
+
+    return matches
 
 
 def extract_query_month_day(query: str) -> tuple[str, int] | None:
@@ -705,6 +763,10 @@ def format_event_name_list_context(items: list[TreeNode]) -> str:
 def build_query_context(query: str, root: TreeNode, retrieved_nodes: list[TreeNode]) -> str:
     if is_general_shaastra_query(query) and not is_schedule_query(query):
         return root.text(include_children=False)
+    if is_detail_query(query):
+        matching_items = matching_named_items_for_query(root, query)
+        if matching_items:
+            return format_retrieved_context(matching_items)
     if is_event_name_list_query(query):
         matching_items = matching_items_for_query_date(root, query)
         if matching_items:
@@ -786,6 +848,262 @@ def event_name_list_answer(query: str, context: str) -> str | None:
     return heading + "\n" + "\n".join(f"- {name}" for name in names)
 
 
+def parse_context_blocks(context: str) -> list[dict[str, str]]:
+    blocks = []
+    for raw_block in re.split(r"\n\s*\n", context.strip()):
+        block = raw_block.strip()
+        if not block:
+            continue
+
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        title = ""
+        details: dict[str, str] = {}
+        category = ""
+        for line in lines:
+            match = re.match(
+                rf"^{re.escape(KNOWN_CONTEXT_PREFIX)}\s*>\s*([^>]+)\s*>\s*([^:>]+)\s*:\s*(.*)$",
+                line,
+            )
+            if match and not title:
+                category = clean_line(match.group(1))
+                title = clean_line(match.group(2))
+                break
+
+        if not title:
+            continue
+
+        detail_pattern = rf"^{re.escape(KNOWN_CONTEXT_PREFIX)}\s*>\s*[^>]+\s*>\s*{re.escape(title)}\s*>\s*([^:]+)\s*:\s*(.*)$"
+        for line in lines:
+            match = re.match(detail_pattern, line)
+            if match:
+                details[clean_line(match.group(1))] = clean_line(match.group(2))
+
+        blocks.append({"title": title, "category": category, **details})
+
+    return blocks
+
+
+def parse_schedule_listings(text: str) -> list[dict[str, str]]:
+    listings = []
+    pattern = (
+        r"Additional schedule listing date:\s*(.*?),\s*time\s*([^,]+),\s*venue\s*([^.]+)"
+    )
+    for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+        listings.append(
+            {
+                "date": clean_line(match.group(1)),
+                "time": clean_line(match.group(2)),
+                "venue": clean_line(match.group(3)),
+            }
+        )
+    return listings
+
+
+def format_schedule_line(index: int, listing: dict[str, str]) -> str:
+    return (
+        f"{index}. "
+        f"Date: {listing['date']}; Time: {listing['time']}; Venue: {listing['venue']}"
+    )
+
+
+def looks_like_schedule_fragment(value: str) -> bool:
+    if not value:
+        return False
+    has_time = bool(re.search(r"\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)?\s*(?:-|to)\s*\d{1,2}", value))
+    has_venue_word = bool(
+        re.search(r"\b(lab|hall|room|rjn|rmn|kcb|bsb|hsb|msb|icsr|sac|oat|clt)\b", value, re.I)
+    )
+    return has_time and has_venue_word and len(value.split()) <= 10
+
+
+def normalize_schedule_key(date: str, time: str, venue: str) -> str:
+    return normalize_lookup_text(f"{date} {time} {venue}")
+
+
+def normalize_date_for_compare(value: str) -> str:
+    normalized = value.lower()
+    normalized = re.sub(r"\b(\d{1,2})(?:st|nd|rd|th)\b", r"\1", normalized)
+    normalized = normalized.replace(",", " ")
+    normalized = re.sub(r"\b2026\b", "", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    match = re.search(r"\b(?:jan|january)\s+(\d{1,2})\b", normalized)
+    if match:
+        return f"january {int(match.group(1))}"
+    match = re.search(r"\b(\d{1,2})\s+(?:jan|january)\b", normalized)
+    if match:
+        return f"january {int(match.group(1))}"
+    return normalize_lookup_text(normalized)
+
+
+def normalize_time_for_compare(value: str) -> str:
+    times = re.findall(
+        r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b",
+        value.lower(),
+        flags=re.IGNORECASE,
+    )
+    if not times:
+        return normalize_lookup_text(value)
+
+    normalized_times = []
+    for hour_text, minute_text, meridiem in times:
+        hour = int(hour_text)
+        minute = int(minute_text or "0")
+        meridiem = meridiem.lower()
+        if meridiem == "pm" and hour != 12:
+            hour += 12
+        elif meridiem == "am" and hour == 12:
+            hour = 0
+        normalized_times.append(f"{hour:02d}:{minute:02d}")
+
+    return "-".join(normalized_times)
+
+
+def equivalent_schedule_key(date: str, time: str, venue: str) -> str:
+    return " | ".join(
+        [
+            normalize_date_for_compare(date),
+            normalize_time_for_compare(time),
+            normalize_lookup_text(venue),
+        ]
+    )
+
+
+def dedupe_repeated_text(value: str) -> str:
+    value = clean_line(value)
+    if not value:
+        return value
+
+    words = value.split()
+    if len(words) % 2 == 0:
+        midpoint = len(words) // 2
+        if words[:midpoint] == words[midpoint:]:
+            return " ".join(words[:midpoint])
+
+    sentences = re.split(r"(?<=[.!?])\s+", value)
+    if len(sentences) > 1:
+        deduped_sentences = []
+        seen_sentences = set()
+        for sentence in sentences:
+            normalized = normalize_lookup_text(sentence)
+            if not normalized or normalized in seen_sentences:
+                continue
+            seen_sentences.add(normalized)
+            deduped_sentences.append(sentence.strip())
+        return " ".join(deduped_sentences)
+
+    return value
+
+
+def is_broad_multi_day_date(value: str) -> bool:
+    return bool(re.search(r"\b(and|to)\b|,|-", value, flags=re.IGNORECASE))
+
+
+def detailed_context_answer(query: str, context: str) -> str | None:
+    if not is_detail_query(query):
+        return None
+
+    blocks = parse_context_blocks(context)
+    if not blocks:
+        return None
+
+    query_normalized = normalize_lookup_text(query)
+    best_block = max(
+        blocks,
+        key=lambda block: len(
+            set(normalize_lookup_text(block["title"]).split())
+            & set(query_normalized.split())
+        ),
+    )
+    if not best_block:
+        return None
+
+    title = best_block["title"]
+    matching_blocks = [
+        block
+        for block in blocks
+        if normalize_lookup_text(block["title"]) == normalize_lookup_text(title)
+    ]
+    merged: dict[str, str] = {"title": title}
+    for block in matching_blocks:
+        for key, value in block.items():
+            if key in {"title", "category"} or not value:
+                continue
+            if key == "Description":
+                current = merged.get(key, "")
+                if looks_like_schedule_fragment(value):
+                    continue
+                if not current or len(value) > len(current):
+                    merged[key] = value
+                continue
+            if key in merged and value in merged[key]:
+                continue
+            merged[key] = f"{merged.get(key, '')} {value}".strip()
+
+    description = merged.get("Description", "")
+    description = dedupe_repeated_text(description)
+    for key in ("Date", "Time", "Venue"):
+        if key in merged:
+            merged[key] = dedupe_repeated_text(merged[key])
+    schedule_text = " ".join(
+        value
+        for key, value in merged.items()
+        if key.lower() in {"schedule note", "date", "time", "venue"}
+    )
+    schedule_listings = parse_schedule_listings(schedule_text)
+
+    answer_lines = [title]
+    if description:
+        answer_lines.append(description)
+
+    if schedule_listings:
+        answer_lines.append("Schedule:")
+        seen_schedules = set()
+        base_date = merged.get("Date", "")
+        base_time = merged.get("Time", "")
+        base_venue = merged.get("Venue", "")
+        if (base_date or base_time or base_venue) and not is_broad_multi_day_date(base_date):
+            seen_schedules.add(equivalent_schedule_key(base_date, base_time, base_venue))
+            answer_lines.append(
+                format_schedule_line(
+                    1,
+                    {
+                        "date": base_date or "Not specified",
+                        "time": base_time or "Not specified",
+                        "venue": base_venue or "Not specified",
+                    },
+                )
+            )
+
+        start_index = len(seen_schedules) + 1
+        for listing in schedule_listings:
+            schedule_key = equivalent_schedule_key(
+                listing["date"], listing["time"], listing["venue"]
+            )
+            if schedule_key in seen_schedules:
+                continue
+            seen_schedules.add(schedule_key)
+            answer_lines.append(format_schedule_line(start_index, listing))
+            start_index += 1
+    else:
+        date = merged.get("Date", "Not specified")
+        time = merged.get("Time", "Not specified")
+        venue = merged.get("Venue", "Not specified")
+        answer_lines.append("Schedule:")
+        answer_lines.append(
+            format_schedule_line(
+                1,
+                {
+                    "date": date,
+                    "time": time,
+                    "venue": venue,
+                },
+            )
+        )
+
+    return "\n".join(answer_lines)
+
+
 def is_schedule_query(query: str) -> bool:
     query_terms = set(re.findall(r"[a-z0-9]+", query.lower()))
     return bool(query_terms & SCHEDULE_QUERY_WORDS)
@@ -793,6 +1111,8 @@ def is_schedule_query(query: str) -> bool:
 
 def is_out_of_scope_query(query: str) -> bool:
     query_terms = set(re.findall(r"[a-z0-9]+", query.lower()))
+    if query_terms & PERSONAL_QUERY_WORDS and not bool(query_terms & SHAASTRA_QUERY_WORDS):
+        return True
     return bool(query_terms & OUT_OF_SCOPE_QUERY_WORDS) and not bool(
         query_terms & SHAASTRA_QUERY_WORDS
     )
@@ -900,6 +1220,10 @@ def generate_answer(
     if event_list_answer:
         return event_list_answer
 
+    detail_answer = detailed_context_answer(query, context)
+    if detail_answer:
+        return detail_answer
+
     long_answer = concise_long_context_answer(context)
     if long_answer:
         return long_answer
@@ -923,8 +1247,8 @@ If the question cannot be answered from the retrieved context, say that the info
 If the retrieved context says it was shortened because it is very long, provide only a few relevant items and mention that the list is not exhaustive.
 Do not force Date, Time, or Venue fields unless the user specifically asks for schedule information.
 If multiple matching items are retrieved, describe each item separately with its name on a new line.
-If you mention an additional schedule listing, include its schedule listing date from the context.
-Do not mention an additional schedule listing if its date is not available in the retrieved context."""
+If the context has multiple additional schedule listings for the same event, mention each listing separately with date, time, and venue.
+Do not merge schedule listings into one venue or one day."""
 
     context = limit_context_for_prompt(context)
 
