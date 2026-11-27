@@ -9,3 +9,12 @@ models/
 # Environment and credentials
 .env
 .streamlit/secrets.toml
+
+# Virtual environment
+.venv/
+
+# Virtual environment
+.venv/
+
+# Virtual environment
+.venv/
