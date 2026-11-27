@@ -1,12 +1,11 @@
+# Python cache
 __pycache__/
 *.pyc
-models/
-.env
-.streamlit/secrets.toml
 
-# Private knowledge base
-shaastra_contextdoc.pdf
-
-# Local LLM files
+# Local LLM models
 models/
 *.gguf
+
+# Environment and credentials
+.env
+.streamlit/secrets.toml
