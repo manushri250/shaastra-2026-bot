@@ -3,3 +3,10 @@ __pycache__/
 models/
 .env
 .streamlit/secrets.toml
+
+# Private knowledge base
+shaastra_contextdoc.pdf
+
+# Local LLM files
+models/
+*.gguf
